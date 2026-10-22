@@ -500,7 +500,7 @@ impl<'data> MachOSigner<'data> {
         };
 
         let platform = 0;
-        let page_size = 4096u32;
+        let page_size = macho.code_directory_page_size() as u32;
 
         let (exec_seg_base, exec_seg_limit) = macho.executable_segment_boundary()?;
         let (exec_seg_base, exec_seg_limit) = (Some(exec_seg_base), Some(exec_seg_limit));
@@ -754,11 +754,12 @@ impl<'data> MachOSigner<'data> {
         let mut size = 1024 * code_directory_count;
 
         // Reserve room for the code digests, which are proportional to binary size.
-        size += macho.code_digests_size(settings.digest_type(SettingsScope::Main), 4096)?;
+        let page_size = macho.code_directory_page_size();
+        size += macho.code_digests_size(settings.digest_type(SettingsScope::Main), page_size)?;
 
         if let Some(digests) = settings.extra_digests(SettingsScope::Main) {
             for digest in digests {
-                size += macho.code_digests_size(*digest, 4096)?;
+                size += macho.code_digests_size(*digest, page_size)?;
             }
         }
 
@@ -791,5 +792,64 @@ impl<'data> MachOSigner<'data> {
         size += 1024 - size % 1024;
 
         Ok(size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, crate::macho_builder::MachOBuilder, goblin::mach::header::MH_DYLIB};
+
+    /// Sign the given Mach-O (ad-hoc) and return the Code Directory page size of each slice.
+    fn sign_and_get_page_sizes(data: &[u8]) -> Vec<u32> {
+        let signer = MachOSigner::new(data).unwrap();
+        let mut settings = SigningSettings::default();
+        settings.set_binary_identifier(SettingsScope::Main, "test.identifier");
+
+        let mut signed = Vec::new();
+        signer
+            .write_signed_binary(&settings, &mut signed)
+            .unwrap();
+
+        MachFile::parse(&signed)
+            .unwrap()
+            .into_iter()
+            .map(|macho| {
+                let signature = macho.code_signature().unwrap().unwrap();
+                let cd = signature.code_directory().unwrap().unwrap();
+
+                // Digest count must match the page size (last page may be partial).
+                let expected = macho
+                    .digested_code_data()
+                    .unwrap()
+                    .chunks(cd.page_size as usize)
+                    .count();
+                assert_eq!(cd.code_digests.len(), expected);
+
+                cd.page_size
+            })
+            .collect()
+    }
+
+    #[test]
+    fn thin_arm64_uses_16k_pages() {
+        let data = MachOBuilder::new_aarch64(MH_DYLIB).write_macho().unwrap();
+        assert_eq!(sign_and_get_page_sizes(&data), vec![16384]);
+    }
+
+    #[test]
+    fn thin_x86_64_uses_4k_pages() {
+        let data = MachOBuilder::new_x86_64(MH_DYLIB).write_macho().unwrap();
+        assert_eq!(sign_and_get_page_sizes(&data), vec![4096]);
+    }
+
+    #[test]
+    fn universal_uses_page_size_per_slice() {
+        let x86 = MachOBuilder::new_x86_64(MH_DYLIB).write_macho().unwrap();
+        let arm = MachOBuilder::new_aarch64(MH_DYLIB).write_macho().unwrap();
+
+        let mut fat = Vec::new();
+        create_universal_macho(&mut fat, [x86.as_slice(), arm.as_slice()].into_iter()).unwrap();
+
+        assert_eq!(sign_and_get_page_sizes(&fat), vec![4096, 16384]);
     }
 }

@@ -239,6 +239,19 @@ impl<'a> MachOBinary<'a> {
         Ok(&self.data[0..code_limit as _])
     }
 
+    /// The Code Directory page size to use for this binary's CPU type.
+    ///
+    /// Apple's `codesign` uses 16 KiB pages for arm64 (including arm64e) and
+    /// 4 KiB pages for everything else. arm64 kernels reject signatures with
+    /// 4 KiB pages ("Invalid Page").
+    pub fn code_directory_page_size(&self) -> usize {
+        if self.macho.header.cputype() == goblin::mach::cputype::CPU_TYPE_ARM64 {
+            16384
+        } else {
+            4096
+        }
+    }
+
     /// Obtain the size in bytes of all code digests given a digest type and page size.
     pub fn code_digests_size(
         &self,
